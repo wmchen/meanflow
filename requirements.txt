@@ -1,0 +1,13 @@
+# base
+tqdm
+mlcbase
+ipykernel
+ipywidgets
+tensorboard
+
+# diffusion
+diffusers==0.31.0
+transformers==4.47.0
+accelerate
+timm
+einops
