@@ -6,7 +6,7 @@ output_dirname="DiT-XL-2_256"
 
 export CUDA_VISIBLE_DEVICES=0,1
 
-accelerate launch --num_processes=2 train_imagenet.py \
+nohup accelerate launch --num_processes=2 train_imagenet.py \
     --output_dir "result/$output_dirname" \
     --tracker_project_name "MeanFlow_DiT-XL/2" \
     --data_path "/home/ailab/datasets_nas/ImageNet-1k/train" \
@@ -41,4 +41,5 @@ accelerate launch --num_processes=2 train_imagenet.py \
     --checkpoints_total_limit 10 \
     --val_inference_steps 1 2 4 \
     --val_class_labels 207 360 387 974 88 979 417 279 \
-    --val_images_each_row 4
+    --val_images_each_row 4 \
+    > log_$output_dirname.txt 2>&1 &
