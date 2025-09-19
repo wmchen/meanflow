@@ -48,7 +48,7 @@ class MeanFlow:
         num_equals = int(self.timestep_equal_ratio * batch_size)
         indices = torch.randperm(batch_size)[:num_equals]
         r[indices] = t[indices]
-        return r, t
+        return r*1000, t*1000
     
     def compute_loss(self, model: DiT, x: torch.Tensor, c: torch.Tensor):
         r, t = self.sample_timesteps(x.shape[0], x.device)
@@ -96,16 +96,6 @@ class MeanFlow:
         mse_value = (error.detach() ** 2).mean()
         
         return loss, mse_value
-    
-    @torch.no_grad()
-    def sample(
-        self, 
-        model: DiT, 
-        classes: Optional[torch.Tensor] = None, 
-        steps: int = 1, 
-        device="cuda"
-    ):
-        model.eval()
 
     def adaptive_l2_loss(self, error):
         delta_sq = torch.mean(error ** 2, dim=(1, 2, 3), keepdim=False)
