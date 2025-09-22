@@ -1,45 +1,58 @@
 #! /bin/bash
+#BSUB -J wmchen
+#BSUB -q gpu-eee-hezh
+#BSUB -n 16
+#BSUB -R "span[ptile=16]"
+#BSUB -e /work/eee-chenwm/Documents/meanflow/log_lsf/err/%J.err
+#BSUB -o /work/eee-chenwm/Documents/meanflow/log_lsf/out/%J.out
+#BSUB -gpu "num=4"
+#BSUB -m "b03u02g"
 
-cd /home/chenwm/meanflow
+source ~/.bashrc
+source activate meanflow
 
-output_dirname="DiT-XL-2_256"
+cd /work/eee-chenwm/Documents/meanflow
 
-export CUDA_VISIBLE_DEVICES=0,1
+output_dirname="DiT-B-4_256"
 
-nohup accelerate launch --num_processes=2 train_imagenet.py \
+accelerate launch \
+    --num_processes=8 \
+    --num_machines=2 \
+    --machine_rank=0 \
+    --main_process_ip="b03u02g" \
+    train_imagenet.py \
     --output_dir "result/$output_dirname" \
-    --tracker_project_name "MeanFlow_DiT-XL/2" \
-    --data_path "/home/ailab/datasets_nas/ImageNet-1k/train" \
+    --tracker_project_name "MeanFlow_DiT-B-4" \
+    --data_path "/work/eee-chenwm/Documents/datasets/ImageNet-1k/train" \
     --image_size 256 \
     --num_classes 1000 \
     --seed 42 \
-    --model "DiT-XL/2" \
-    --vae "/home/ailab/model_weights_nas/stable-diffusion/vae/sd-vae-ft-mse" \
+    --model "DiT-B/4" \
+    --vae "/work/eee-chenwm/Documents/checkpoints/vae/sd-vae-ft-mse" \
     --timestep_equal_ratio 0.75 \
-    --cfg_ratio 1.0 \
-    --cfg_w_prime 2.5 \
-    --cfg_w 0.2 \
-    --cfg_trigger_t_min 0.3 \
-    --cfg_trigger_t_max 0.8 \
+    --cfg_class_dropout_prob 0.1 \
+    --cfg_w_prime 3.0 \
+    --cfg_w 3.0 \
+    --cfg_trigger_t_min 0.0 \
+    --cfg_trigger_t_max 1.0 \
     --p 1.0 \
     --eps 0.000001 \
     --num_train_epochs 80 \
-    --train_batch_size 16 \
-    --dataloader_num_workers 0 \
+    --train_batch_size 32 \
+    --dataloader_num_workers 8 \
     --gradient_accumulation_steps 1 \
     --use_ema \
     --foreach_ema \
     --learning_rate 0.0001 \
     --adam_beta1 0.9 \
-    --adam_beta2 0.999 \
+    --adam_beta2 0.95 \
     --adam_weight_decay 0.01 \
     --adam_epsilon 0.00000001 \
     --max_grad_norm 1.0 \
     --lr_scheduler "constant" \
-    --lr_warmup_steps 500 \
-    --checkpointing_steps 10 \
+    --lr_warmup_steps 0 \
+    --checkpointing_steps 10000 \
     --checkpoints_total_limit 10 \
     --val_inference_steps 1 2 4 \
     --val_class_labels 207 360 387 974 88 979 417 279 \
-    --val_images_each_row 4 \
-    > log_$output_dirname.txt 2>&1 &
+    --val_images_each_row 4
