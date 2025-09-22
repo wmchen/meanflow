@@ -36,36 +36,17 @@ def main(args):
     # Create sampling noise:
     z = torch.randn(len(class_labels), 4, latent_size, latent_size, device=device)
     y = torch.tensor(class_labels, device=device)
-    if args.guidance_scale > 1.0:
-        y_null = torch.tensor([1000], device=device)
 
     # denoise
     timesteps = torch.linspace(1.0, 0.0, args.num_steps+1, dtype=torch.float32)
     with tqdm(total=args.num_steps) as pbar:
         for i in range(args.num_steps):
-            if args.guidance_scale > 1.0:
-                t = torch.full((1, ), timesteps[i], device=device)
-                r = torch.full((1, ), timesteps[i+1], device=device)
-                t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
-                r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
-                for j in range(len(class_labels)):
-                    z_ = z[j, :, :, :].unsqueeze(0)
-                    z_ = torch.cat([z_, z_], dim=0)
-                    c = torch.cat([y[j].unsqueeze(0), y_null], dim=0)
-
-                    u = model(z_, r, t, c)
-                    u_cond, u_uncond = u.chunk(2, dim=0)
-                    u = args.guidance_scale * u_cond + (1 - args.guidance_scale) * u_uncond
-                    
-                    z_ = z[j, :, :, :].unsqueeze(0) - (t_ - r_) * u
-                    z[j, :, :, :] = z_.squeeze(0)
-            else:
-                t = torch.full((len(class_labels), ), timesteps[i], device=device)
-                r = torch.full((len(class_labels), ), timesteps[i+1], device=device)
-                t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
-                r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
-                u = model(z, r, t, y)
-                z = z - (t_ - r_) * u
+            t = torch.full((len(class_labels), ), timesteps[i], device=device)
+            r = torch.full((len(class_labels), ), timesteps[i+1], device=device)
+            t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
+            r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
+            u = model(z, r, t, y)
+            z = z - (t_ - r_) * u
             pbar.update(1)
 
     # decode to image
