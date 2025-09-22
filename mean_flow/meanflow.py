@@ -14,7 +14,6 @@ class MeanFlow:
         num_classes: int = 1000,
         timestep_equal_ratio: float = 0.75,  # ratio of r=t
         timestep_dist: dict = {"type": "lognorm", "mu": -0.4, "sigma": 1.0},
-        cfg_ratio: float = 0.1,
         cfg_w_prime: Optional[float] = 3.0,
         cfg_w: Optional[float] = 3.0,
         cfg_trigger_t_min: float = 0.0,
@@ -27,7 +26,6 @@ class MeanFlow:
         self.num_classes = num_classes
         self.timestep_equal_ratio = timestep_equal_ratio
         self.timestep_dist = timestep_dist
-        self.cfg_ratio = cfg_ratio
         self.cfg_w_prime = cfg_w_prime
         self.cfg_w = cfg_w
         self.cfg_k = 1 - cfg_w / cfg_w_prime
@@ -48,7 +46,7 @@ class MeanFlow:
         num_equals = int(self.timestep_equal_ratio * batch_size)
         indices = torch.randperm(batch_size)[:num_equals]
         r[indices] = t[indices]
-        return r*1000, t*1000
+        return r, t
     
     def compute_loss(self, model: DiT, x: torch.Tensor, c: torch.Tensor):
         r, t = self.sample_timesteps(x.shape[0], x.device)
@@ -62,8 +60,6 @@ class MeanFlow:
 
         # apply CFG
         uncond = torch.ones_like(c) * self.num_classes
-        cfg_mask = torch.rand_like(c.float()) < self.cfg_ratio
-        c = torch.where(cfg_mask, uncond, c)
         if self.cfg_w is not None:
             v_hat = v.detach().clone()
             for i in range(v_hat.shape[0]):

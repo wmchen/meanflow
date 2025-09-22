@@ -40,7 +40,7 @@ def parse_args():
 
     # meanflow settings
     parser.add_argument("--timestep_equal_ratio", type=float, default=0.75)
-    parser.add_argument("--cfg_ratio", type=float, default=0.1)
+    parser.add_argument("--cfg_class_dropout_prob", type=float, default=0.1)
     parser.add_argument("--cfg_w_prime", type=float, default=3.0)
     parser.add_argument("--cfg_w", type=float, default=3.0)
     parser.add_argument("--cfg_trigger_t_min", type=float, default=0.0)
@@ -167,7 +167,7 @@ def main():
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        class_dropout_prob=args.cfg_ratio
+        class_dropout_prob=args.cfg_class_dropout_prob
     ).to(accelerator.device)
 
     model.train()
@@ -209,7 +209,6 @@ def main():
         channels=4,
         image_size=args.image_size//8,
         timestep_equal_ratio=args.timestep_equal_ratio,
-        cfg_ratio=args.cfg_ratio,
         cfg_w_prime=args.cfg_w_prime,
         cfg_w=args.cfg_w,
         cfg_trigger_t_min=args.cfg_trigger_t_min,
@@ -315,7 +314,7 @@ def main():
                     step=global_step
                 )
                 train_loss = 0.0
-                train_loss = 0.0
+                train_mse_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -372,7 +371,8 @@ def main():
                         r = torch.full((len(class_labels), ), timesteps[i+1], device=accelerator.device)
                         t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
                         r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
-                        u = model(z, r, t, y)
+                        with torch.no_grad():
+                            u = model(z, r, t, y)
                         z = z - (t_ - r_) * u
                     images = vae.decode(z / 0.18215).sample
                     images = make_grid(images, nrow=args.val_images_each_row, normalize=True, value_range=(-1, 1)).unsqueeze(0)
