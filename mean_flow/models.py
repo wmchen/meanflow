@@ -68,28 +68,15 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
+    def __init__(self, num_classes, hidden_size, is_cond: bool):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        if is_cond:
+            self.embedding_table = nn.Embedding(num_classes+1, hidden_size)
         else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
+            self.embedding_table = nn.Embedding(num_classes, hidden_size)
+        self.num_classes = num_classes
 
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
+    def forward(self, labels):
         embeddings = self.embedding_table(labels)
         return embeddings
 
@@ -156,8 +143,8 @@ class DiT(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        class_dropout_prob=0.1,
         num_classes=1000,
+        is_cond: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -168,10 +155,10 @@ class DiT(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.r_embedder = TimestepEmbedder(hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, is_cond)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=True)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -203,6 +190,8 @@ class DiT(nn.Module):
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.r_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.r_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
@@ -239,11 +228,10 @@ class DiT(nn.Module):
         y: (N,) tensor of class labels
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        r = self.r_embedder(r)                   # (N, D)
+        r = self.r_embedder(t-r)                 # (N, D)
         t = self.t_embedder(t)                   # (N, D)
-        t = t + r
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        y = self.y_embedder(y)                   # (N, D)
+        c = r + t + y                            # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)               # (N, T, patch_size ** 2 * out_channels)

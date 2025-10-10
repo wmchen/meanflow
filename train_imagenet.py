@@ -3,7 +3,9 @@ import shutil
 import argparse
 import logging
 import math
+from datetime import datetime, timedelta
 from copy import deepcopy
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -14,10 +16,8 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.models import AutoencoderKL
-from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 from PIL import Image
-from einops import rearrange
 from mlcbase import create
 
 from mean_flow import MeanFlow, DiT_models
@@ -40,11 +40,15 @@ def parse_args():
 
     # meanflow settings
     parser.add_argument("--timestep_equal_ratio", type=float, default=0.75)
-    parser.add_argument("--cfg_class_dropout_prob", type=float, default=0.1)
-    parser.add_argument("--cfg_w_prime", type=float, default=3.0)
+    parser.add_argument("--timestep_dist_type", type=str, choices=["lognorm", "uniform"], default="lognorm")
+    parser.add_argument("--timestep_dist_mu", type=float, default=-0.4)
+    parser.add_argument("--timestep_dist_sigma", type=float, default=1.0)
+    parser.add_argument("--cfg", action="store_true")
     parser.add_argument("--cfg_w", type=float, default=3.0)
+    parser.add_argument("--cfg_k", type=float, default=0.0)
     parser.add_argument("--cfg_trigger_t_min", type=float, default=0.0)
     parser.add_argument("--cfg_trigger_t_max", type=float, default=1.0)
+    parser.add_argument("--cfg_cond_dropout", type=float, default=0.1)
     parser.add_argument("--p", type=float, default=1.0)
     parser.add_argument("--eps", type=float, default=1e-6)
 
@@ -61,8 +65,8 @@ def parse_args():
     )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--offload_ema", action="store_true", help="Offload EMA model to CPU during training step.")
-    parser.add_argument("--foreach_ema", action="store_true", help="Use faster foreach implementation of EMAModel.")
 
     # optimizer settings
     parser.add_argument("--learning_rate", type=float, default=0.0001)
@@ -98,6 +102,9 @@ def parse_args():
     parser.add_argument("--val_class_labels", type=int, nargs="+", default=None)
     parser.add_argument("--val_images_each_row", type=int, default=4)
 
+    # others
+    parser.add_argument("--remarks", type=str, default=None)
+
     args = parser.parse_args()
 
     return args
@@ -122,6 +129,126 @@ def center_crop_arr(pil_image, image_size):
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        name = name.replace("module.", "")
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+
+def format_time(time: timedelta, timeformat: str ="%d days %H:%M:%S"):
+    if "%d" in timeformat:
+        has_day = True
+    else:
+        has_day = False
+
+    if "%H" in timeformat:
+        has_hour = True
+    else:
+        has_hour = False
+
+    if "%M" in timeformat:
+        has_minute = True
+    else:
+        has_minute = False
+    
+    if "%S" in timeformat:
+        has_second = True
+    else:
+        has_second = False
+
+    if "%f" in timeformat:
+        has_microsecond = True
+    else:
+        has_microsecond = False
+
+    delta_days = time.days
+    delta_seconds = time.seconds
+    microseconds = time.microseconds
+    hours = delta_seconds // 3600
+    minute = (delta_seconds % 3600) // 60
+    seconds = delta_seconds % 60
+    show_day = 0
+    show_hour = 0
+    show_minute = 0
+    show_second = 0
+    show_microsecond = 0
+
+    # if %d not in timeformat, unsqueeze days to hours
+    if has_day:
+        show_day = delta_days
+    else:
+        hours += delta_days * 24
+
+    # if %H not in timeformat, unsqueeze hours to minutes
+    if has_hour:
+        show_hour = hours
+    else:
+        minute += hours * 60
+
+    # if %M not in timeformat, unsqueeze minutes to seconds
+    if has_minute:
+        show_minute = minute
+    else:
+        seconds += minute * 60
+
+    # if %S not in timeformat, unsqueeze seconds to microseconds
+    if has_second:
+        show_second = seconds
+    else:
+        microseconds += seconds * 10**6
+
+    # ignore microsecond when %f not exists in timeformat
+    if has_microsecond:
+        show_microsecond = microseconds
+
+    show_day = str(show_day)
+    show_hour = f"{show_hour:02d}"
+    show_minute = f"{show_minute:02d}"
+    show_second = f"{show_second:02d}"
+    show_microsecond = str(show_microsecond)
+
+    return show_day, show_hour, show_minute, show_second, show_microsecond
+
+
+def format_show_time(days, hours, minutes, seconds, microseconds, timeformat="%d days %H:%M:%S"):
+    show_text = ""
+    format_flag = False
+    format_symbol = ""
+    for ch in timeformat:
+        if ch == "%":
+            format_flag = True
+            format_symbol += "%"
+            continue
+
+        if format_flag:
+            format_symbol += ch
+            if format_symbol == "%d":
+                show_text += (days)
+            elif format_symbol == "%H":
+                show_text += hours
+            elif format_symbol == "%M":
+                show_text += minutes
+            elif format_symbol == "%S":
+                show_text += seconds
+            elif format_symbol == "%f":
+                show_text += microseconds
+            else:
+                show_text += format_symbol
+            format_symbol = ""
+            format_flag = False
+        else:
+            show_text += ch
+            
+    return show_text
 
 
 def main():
@@ -158,7 +285,8 @@ def main():
         train_dataset,
         shuffle=True,
         batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers
+        num_workers=args.dataloader_num_workers,
+        pin_memory=True
     )
     logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_path})")
 
@@ -167,14 +295,13 @@ def main():
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        class_dropout_prob=args.cfg_class_dropout_prob
+        is_cond=True
     ).to(accelerator.device)
-
     model.train()
     if args.use_ema:
-        ema = deepcopy(model)
+        ema = deepcopy(model).requires_grad_(False)
+        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
         ema.eval()
-        ema = EMAModel(ema.parameters(), foreach=args.foreach_ema)
         if args.offload_ema:
             ema.pin_memory()
         else:
@@ -207,18 +334,21 @@ def main():
     # meanflow
     meanflow = MeanFlow(
         channels=4,
-        image_size=args.image_size//8,
+        image_size=args.image_size,
+        num_classes=1000,
         timestep_equal_ratio=args.timestep_equal_ratio,
-        cfg_w_prime=args.cfg_w_prime,
+        timestep_dist_type=args.timestep_dist_type,
+        timestep_dist_mu=args.timestep_dist_mu,
+        timestep_dist_sigma=args.timestep_dist_sigma,
+        cfg=args.cfg,
         cfg_w=args.cfg_w,
+        cfg_k=args.cfg_k,
         cfg_trigger_t_min=args.cfg_trigger_t_min,
         cfg_trigger_t_max=args.cfg_trigger_t_max,
+        cfg_cond_dropout=args.cfg_cond_dropout,
         p=args.p,
         eps=args.eps
     )
-
-    # prepare
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
 
     # tracker
     if accelerator.is_main_process:
@@ -247,10 +377,10 @@ def main():
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            checkpoints = os.listdir(args.output_dir)
+            checkpoints = [d for d in checkpoints if d.startswith("checkpoint") and d.endswith(".pth")]
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split(".")[0].split("-")[1]))
+            path = checkpoints[-1] if len(checkpoints) > 0 else None
 
         if path is None:
             accelerator.print(
@@ -260,23 +390,30 @@ def main():
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
+            ckpt = torch.load(os.path.join(args.output_dir, path), map_location="cpu")
+            model.load_state_dict(ckpt["model"])
+            ema.load_state_dict(ckpt['ema'])
+            optimizer.load_state_dict(ckpt['opt'])
+            global_step = ckpt['steps']
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-
     else:
         initial_global_step = 0
+
+    # prepare
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
     
     # start training loop
+    start_time = datetime.now()
+    last_update_time = deepcopy(start_time)
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         train_mse_loss = 0.0
         for step, (x, y) in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                x = x.to(accelerator.device)
-                y = y.to(accelerator.device)
+                x = x.to(accelerator.device, non_blocking=True)
+                y = y.to(accelerator.device, non_blocking=True)
                 with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
@@ -302,10 +439,30 @@ def main():
                 if args.use_ema:
                     if args.offload_ema:
                         ema.to(device="cuda", non_blocking=True)
-                    ema.step(model.parameters())
+                    update_ema(ema, model, decay=args.ema_decay)
                     if args.offload_ema:
                         ema.to(device="cpu", non_blocking=True)
-                logger.info(f"Global Step: {global_step}, Epoch: {epoch}, Loss: {train_loss}, MSE Loss: {train_mse_loss}")
+
+                cur_time = datetime.now()
+                elapsed = cur_time - start_time
+                days, hours, minutes, seconds, microseconds = format_time(elapsed)
+                elapsed_text = format_show_time(days, hours, minutes, seconds, microseconds)
+                elapsed_unit_time = cur_time - last_update_time
+                _, _, _, seconds, microseconds = format_time(elapsed_unit_time, "%S%f")
+                seconds = int(seconds) + int(microseconds) / 10**6
+                if seconds == 0:
+                    left_time_text = "unknown"
+                else:
+                    velocity = 1.0 / seconds
+                    left_time = timedelta(seconds=int((max_train_steps-global_step-1) / velocity))
+                    days, hours, minutes, seconds, microseconds = format_time(left_time)
+                    left_time_text = format_show_time(days, hours, minutes, seconds, microseconds)
+                last_update_time = deepcopy(cur_time)
+
+                logger.info(
+                    f"Global Step: {global_step+1}/{max_train_steps}, Epoch: {epoch}, Loss: {train_loss:.4f}, "
+                    f"MSE Loss: {train_mse_loss:.4f} (Elapsed: {elapsed_text}, Left: {left_time_text}, {velocity:.2f} step/s)"
+                )
                 global_step += 1
                 accelerator.log(
                     {"train_loss": train_loss, 
@@ -321,8 +478,8 @@ def main():
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint") and d.endswith(".pth")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split(".")[0].split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
@@ -336,10 +493,17 @@ def main():
 
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                                    os.remove(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.pth")
+                        ckpt = {
+                            "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": optimizer.state_dict(),
+                            "args": args,
+                            "steps": global_step,
+                        }
+                        torch.save(ckpt, save_path)
                         logger.info(f"Saved state to {save_path}")
                 
             if global_step >= max_train_steps:
@@ -353,42 +517,46 @@ def main():
                     if tracker.name == "tensorboard":
                         break
 
-                val_model = accelerator.unwrap_model(model)
-                val_model.eval()
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema.store(val_model.parameters())
-                    ema.copy_to(val_model.parameters())
+                    val_model = ema
+                else:
+                    val_model = accelerator.unwrap_model(model)
+                    val_model.eval()
 
                 class_labels = [int(i) for i in args.val_class_labels]
                 for num_steps in args.val_inference_steps:
                     logger.info(f"Inference with {num_steps} steps...")
-                    z = torch.randn(len(class_labels), 4, latent_size, latent_size, device=accelerator.device)
-                    y = torch.tensor(class_labels, device=accelerator.device)
-                    timesteps = torch.linspace(1.0, 0.0, num_steps+1, dtype=torch.float32)
-                    for i in range(num_steps):
-                        t = torch.full((len(class_labels), ), timesteps[i], device=accelerator.device)
-                        r = torch.full((len(class_labels), ), timesteps[i+1], device=accelerator.device)
-                        t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
-                        r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
-                        with torch.no_grad():
-                            u = model(z, r, t, y)
-                        z = z - (t_ - r_) * u
-                    images = vae.decode(z / 0.18215).sample
-                    images = make_grid(images, nrow=args.val_images_each_row, normalize=True, value_range=(-1, 1)).unsqueeze(0)
-                    images = images.mul(255).add_(0.5).clamp_(0, 255).permute(0, 2, 3, 1).to("cpu", torch.uint8).numpy()
+                    images = meanflow.sample(
+                        model=val_model, 
+                        vae=vae, 
+                        labels=class_labels,
+                        num_sample_steps=num_steps,
+                        num_images_per_label=1,
+                        device=accelerator.device,
+                        output_type="pt"
+                    )
+                    images = make_grid(images, nrow=args.val_images_each_row).unsqueeze(0)
+                    images = images.mul(0.5).add_(0.5).clamp_(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", torch.uint8).numpy()
                     tracker.log_images({f"val_{num_steps}-step": images}, step=global_step, dataformats="NHWC")
 
-                del val_model
+                if not args.use_ema:
+                    del val_model
     
     accelerator.wait_for_everyone()
 
     # final save
     if accelerator.is_main_process:
         model = accelerator.unwrap_model(model)
-        if args.use_ema:
-            ema.copy_to(model.parameters())
-        torch.save(model.state_dict(), os.path.join(args.output_dir, "train_done.pth"))
+        ckpt = {"model": model.state_dict(), "ema": ema.state_dict()}
+        torch.save(
+            ckpt, 
+            os.path.join(
+                args.output_dir, 
+                f"MF_{args.model.replace('/', '-')}_res{args.image_size}_e{args.num_train_epochs}.pth"
+            )
+        )
+        logger.info("Training completed!")
     
     accelerator.end_training()
 

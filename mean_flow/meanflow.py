@@ -1,8 +1,11 @@
 import functools
-from typing import Optional
+from typing import Union, List
 
+import numpy as np
 import torch
+from diffusers.models import AutoencoderKL
 from einops import rearrange
+from PIL import Image
 from .models import DiT
 
 
@@ -10,34 +13,44 @@ class MeanFlow:
     def __init__(
         self,
         channels: int = 4,
-        image_size: int = 32,
+        image_size: int = 256,
         num_classes: int = 1000,
         timestep_equal_ratio: float = 0.75,  # ratio of r=t
-        timestep_dist: dict = {"type": "lognorm", "mu": -0.4, "sigma": 1.0},
-        cfg_w_prime: Optional[float] = 3.0,
-        cfg_w: Optional[float] = 3.0,
+        timestep_dist_type: str = "lognorm",
+        timestep_dist_mu: float = -0.4,
+        timestep_dist_sigma: float = 1.0,
+        cfg: bool = True,
+        cfg_w: float = 3.0,
+        cfg_k: float = 0.0,
         cfg_trigger_t_min: float = 0.0,
         cfg_trigger_t_max: float = 1.0,
+        cfg_cond_dropout: float = 0.1,
         p: float = 1.0,
         eps: float = 1e-6
     ):
+        if cfg:
+            assert cfg_w >= 1.0 and 0.0 <= cfg_k < 1.0
+
         self.channels = channels
         self.image_size = image_size
         self.num_classes = num_classes
         self.timestep_equal_ratio = timestep_equal_ratio
-        self.timestep_dist = timestep_dist
-        self.cfg_w_prime = cfg_w_prime
+        self.timestep_dist_type = timestep_dist_type
+        self.timestep_dist_mu = timestep_dist_mu
+        self.timestep_dist_sigma = timestep_dist_sigma
+        self.cfg = cfg
         self.cfg_w = cfg_w
-        self.cfg_k = 1 - cfg_w / cfg_w_prime
+        self.cfg_k = cfg_k
         self.cfg_trigger_t_min = cfg_trigger_t_min
         self.cfg_trigger_t_max = cfg_trigger_t_max
+        self.cfg_cond_dropout = cfg_cond_dropout
         self.p = p
         self.eps = eps
 
     def sample_timesteps(self, batch_size: int, device):
-        if self.timestep_dist["type"] == "lognorm":
-            samples = torch.randn((batch_size, 2), device=device) * self.timestep_dist["sigma"] + self.timestep_dist["mu"]
-        elif self.timestep_dist["type"] == "uniform":
+        if self.timestep_dist_type == "lognorm":
+            samples = torch.randn((batch_size, 2), device=device) * self.timestep_dist_sigma + self.timestep_dist_mu
+        elif self.timestep_dist_type == "uniform":
             samples = torch.randn((batch_size, 2), device=device)
 
         samples = torch.sigmoid(samples)
@@ -59,42 +72,102 @@ class MeanFlow:
         v = e - x  # conditional velocity
 
         # apply CFG
-        uncond = torch.ones_like(c) * self.num_classes
-        if self.cfg_w is not None:
-            v_hat = v.detach().clone()
-            for i in range(v_hat.shape[0]):
-                if self.cfg_trigger_t_min <= t[i].item() <= self.cfg_trigger_t_max:
-                    # improved CFG for meanflow
-                    z_ = z[i, :, :, :].unsqueeze(0)
-                    v_ = v[i, :, :, :].unsqueeze(0)
-                    t_i = t[i].unsqueeze(0)
-                    uncond_ = uncond[i].unsqueeze(0)
-                    cond_ = c[i].unsqueeze(0)
-                    with torch.no_grad():
-                        u_cfg_cond = model(z_, t_i, t_i, cond_)
-                        u_cfg_uncond = model(z_, t_i, t_i, uncond_)
-                    v_hat_ = self.cfg_w * v_ + self.cfg_k * u_cfg_cond + (1 - self.cfg_w - self.cfg_k) * u_cfg_uncond
-                    v_hat[i, :, :, :] = v_hat_.squeeze(0)
+        if self.cfg:
+            uncond = torch.ones_like(c) * self.num_classes
+            w = torch.where((self.cfg_trigger_t_min <= t) & (t <= self.cfg_trigger_t_max), self.cfg_w, 1.0)
+            w = w.view(-1, 1, 1, 1)
+            if self.cfg_k == 0:
+                # normal CFG
+                u_cfg_uncond = model(z, t, t, uncond)
+                v_hat = w * v + (1.0 - w) * u_cfg_uncond
+            else:
+                # improved CFG in Appendix
+                k = torch.where((self.cfg_trigger_t_min <= t) & (t <= self.cfg_trigger_t_max), self.cfg_k, 0.0)
+                k = k.view(-1, 1, 1, 1)
+                u_cfg_cond = model(z, t, t, c)
+                u_cfg_uncond = model(z, t, t, uncond)
+                v_hat = w * v + k * u_cfg_cond + (1.0 - w - k) * u_cfg_uncond
+            
+            # apply conditional dropout
+            mask = torch.rand_like(c.float()) < self.cfg_cond_dropout
+            c = torch.where(mask, uncond, c)
+            v_hat = torch.where(mask.view(-1, 1, 1, 1), v, v_hat)
         else:
             v_hat = v
         
         # predict
         model_partial = functools.partial(model, y=c)
-        u, dudt = torch.autograd.functional.jvp(
+        u, dudt = torch.func.jvp(
             func=lambda z, r, t: model_partial(x=z, r=r, t=t),
-            inputs=(z, r, t),
-            v=(v_hat, torch.zeros_like(r), torch.ones_like(t)),
-            create_graph=True
+            primals=(z, r, t),
+            tangents=(v_hat, torch.zeros_like(r), torch.ones_like(t)),
         )
         u_tgt = v_hat - (t_ - r_) * dudt
         error = u - u_tgt.detach()
         loss = self.adaptive_l2_loss(error)
-        mse_value = (error.detach() ** 2).mean()
+        mse_value = (error ** 2).mean()
         
         return loss, mse_value
 
+    @torch.no_grad()
+    def sample(
+        self, 
+        model: DiT, 
+        vae: AutoencoderKL,
+        labels: Union[int, List[int]],
+        num_sample_steps: int = 1,
+        num_images_per_label: int = 1, 
+        vae_scaling_factor: float = 0.18215,
+        device: str = "cuda",
+        output_type: str = "pil"
+    ) -> List[Image.Image]:
+        if isinstance(labels, int):
+            labels = [labels]
+        
+        if output_type == "pil":
+            resuls = []
+        elif output_type == "np" or output_type == "pt":
+            resuls = None
+
+        vae_resolution_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+        latent_size = self.image_size // vae_resolution_scale_factor
+        for i, label in enumerate(labels):
+            print(f"Sampling label {label} ({i+1}/{len(labels)})...")
+
+            z = torch.randn(num_images_per_label, self.channels, latent_size, latent_size, device=device)
+            y = torch.tensor([label] * num_images_per_label, device=device)
+            timesteps = torch.linspace(1.0, 0.0, num_sample_steps+1, dtype=torch.float32)
+
+            for j in range(num_sample_steps):
+                t = torch.full((num_images_per_label, ), timesteps[j], device=device)
+                r = torch.full((num_images_per_label, ), timesteps[j+1], device=device)
+                u = model(z, r, t, y)
+                t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
+                r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
+                z = z - (t_ - r_) * u
+            
+            images = vae.decode(z / vae_scaling_factor).sample
+            if output_type == "pil" or output_type == "np":
+                images = images.mul(0.5).add_(0.5).clamp_(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", torch.uint8).numpy()
+                if output_type == "pil":
+                    for j in range(num_images_per_label):
+                        image = Image.fromarray(images[j])
+                        resuls.append(image)
+                else:
+                    if resuls is None:
+                        resuls = images
+                    else:
+                        resuls = np.concatenate([resuls, images], axis=0)  
+            elif output_type == "pt":
+                if resuls is None:
+                    resuls = images
+                else:
+                    resuls = torch.cat([resuls, images], dim=0)
+        
+        return resuls
+
     def adaptive_l2_loss(self, error):
-        delta_sq = torch.mean(error ** 2, dim=(1, 2, 3), keepdim=False)
-        w = 1.0 / (delta_sq + self.eps).pow(self.p)
-        loss = delta_sq  # ||Δ||^2
-        return (w.detach() * loss).mean()
+        delta_sq = torch.sum((error**2).reshape(error.shape[0], -1), dim=-1)
+        w = 1.0 / (delta_sq.detach() + self.eps).pow(self.p)
+        loss = w * delta_sq
+        return loss.mean()

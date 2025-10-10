@@ -45,14 +45,14 @@ def main(args):
             r = torch.full((len(class_labels), ), timesteps[i+1], device=device)
             t_ = rearrange(t, "b -> b 1 1 1").detach().clone()
             r_ = rearrange(r, "b -> b 1 1 1").detach().clone()
-            u = model(z, r, t, y)
+            u = model(z, t-r, t, y)
             z = z - (t_ - r_) * u
             pbar.update(1)
 
     # decode to image
     images = vae.decode(z / 0.18215).sample
-    images = make_grid(images, nrow=args.num_images_each_row, normalize=True, value_range=(-1, 1))
-    images = images.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+    images = make_grid(images, nrow=args.num_images_each_row)
+    images = images.mul(0.5).add_(0.5).clamp_(0, 1).mul(255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
     images = Image.fromarray(images)
     images.save(args.output_path)
 
