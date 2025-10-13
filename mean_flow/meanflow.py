@@ -28,9 +28,6 @@ class MeanFlow:
         p: float = 1.0,
         eps: float = 1e-6
     ):
-        if cfg:
-            assert cfg_w >= 1.0 and 0.0 <= cfg_k < 1.0
-
         self.channels = channels
         self.image_size = image_size
         self.num_classes = num_classes
