@@ -13,7 +13,7 @@ source activate meanflow
 
 cd /work/eee-chenwm/Documents/meanflow
 
-output_dirname="20251010_MF_DiT-B-4_256"
+output_dirname="MF_DiT-M-2_256"
 
 accelerate launch \
     --num_processes=8 \
@@ -27,21 +27,21 @@ accelerate launch \
     --image_size 256 \
     --num_classes 1000 \
     --seed 42 \
-    --model "DiT-B/4" \
+    --model "DiT-M/2" \
     --vae "/work/eee-chenwm/Documents/checkpoints/vae/sd-vae-ft-mse" \
     --timestep_equal_ratio 0.75 \
     --timestep_dist_type "lognorm" \
     --timestep_dist_mu -0.4 \
     --timestep_dist_sigma 1.0 \
     --cfg \
-    --cfg_w 3.0 \
-    --cfg_k 0.0 \
+    --cfg_w 1.0 \
+    --cfg_k 0.5 \
     --cfg_trigger_t_min 0.0 \
     --cfg_trigger_t_max 1.0 \
     --cfg_cond_dropout 0.1 \
     --p 1.0 \
     --eps 0.000001 \
-    --num_train_epochs 80 \
+    --num_train_epochs 240 \
     --train_batch_size 32 \
     --dataloader_num_workers 16 \
     --gradient_accumulation_steps 1 \

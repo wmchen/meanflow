@@ -392,7 +392,8 @@ def main():
             accelerator.print(f"Resuming from checkpoint {path}")
             ckpt = torch.load(os.path.join(args.output_dir, path), map_location="cpu")
             model.load_state_dict(ckpt["model"])
-            ema.load_state_dict(ckpt['ema'])
+            if args.use_ema:
+                ema.load_state_dict(ckpt['ema'])
             optimizer.load_state_dict(ckpt['opt'])
             global_step = ckpt['steps']
 
